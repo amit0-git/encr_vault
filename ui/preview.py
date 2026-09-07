@@ -4,6 +4,7 @@ from collections import OrderedDict
 import sys
 import time
 from pathlib import Path
+from threading import Event
 
 # Allow this UI module to be launched directly by an IDE as well as imported
 # from main.py.  In direct-script mode, Python otherwise only searches `ui/`.
@@ -12,14 +13,14 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QSettings, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
+from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QSettings, Signal, Slot, QFile
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QImageReader
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QScrollArea, QToolButton, QVBoxLayout, QWidget, QMessageBox, QPushButton, QStyle, QSpinBox
 )
 
-from core.preview import decrypt_preview, decrypt_to_temp
+from core.preview import authenticate_vault, secure_preview_file, cleanup_stale_preview_files
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
 
@@ -115,33 +116,115 @@ def _remove_preview_sidebar_timer(self):
         self._preview_sidebar_timer_widget = None
 
 class ThumbSignals(QObject):
-    ready = Signal(str, QPixmap)
+    ready = Signal(str, QPixmap, int)
+
+
+class PreviewSession:
+    """Owns the gallery password and a cancellation generation.
+
+    The raw password is never copied into individual thumbnail jobs. Each vault
+    derives its own short-lived key because every vault has its own salt.
+    """
+    def __init__(self, password: str):
+        self.password = password
+        self._closed = False
+
+    def close(self):
+        self._closed = True
+        self.password = ""
 
 
 class ThumbnailTask(QRunnable):
-    def __init__(self, path: Path, password: str, size: QSize, signals: ThumbSignals):
+    def __init__(self, path: Path, session: PreviewSession, size: QSize, signals: ThumbSignals, cancel_event, generation: int):
         super().__init__()
-        self.path, self.password, self.size, self.signals = path, password, size, signals
+        self.setAutoDelete(True)
+        self.path = Path(path)
+        self.session = session
+        self.size = QSize(size)
+        self.signals = signals
+        self.cancel_event = cancel_event
+        self.generation = generation
 
     @Slot()
     def run(self):
         try:
-            data = decrypt_preview(self.path, self.password, max_bytes=48 * 1024 * 1024)
-            image = QImage()
-            if not image.loadFromData(data):
-                raise ValueError("unsupported image")
-            pix = QPixmap.fromImage(image).scaled(
-                self.size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
-            )
-            self.signals.ready.emit(str(self.path), pix)
+            if self.cancel_event.is_set() or self.session._closed:
+                return
+            if self.cancel_event.is_set():
+                return
+            # Authenticate and decrypt through one source file handle. This
+            # avoids a time-of-check/time-of-use window between authentication
+            # and preview materialization.
+            with secure_preview_file(
+                self.path, password=self.session.password,
+                max_bytes=48 * 1024 * 1024, cancel_event=self.cancel_event
+            ) as tmp:
+                if self.cancel_event.is_set():
+                    return
+                image = _read_scaled_image(tmp, self.size, self.cancel_event)
+            if image is None or image.isNull() or self.cancel_event.is_set():
+                return
+            pix = QPixmap.fromImage(image)
+            del image
+            if self.cancel_event.is_set() or self.session._closed:
+                pix = QPixmap()
+                return
+            self.signals.ready.emit(str(self.path), pix, self.generation)
         except Exception:
-            self.signals.ready.emit(str(self.path), placeholder(self.size, "Unavailable"))
+            if not self.cancel_event.is_set() and not self.session._closed:
+                self.signals.ready.emit(str(self.path), placeholder(self.size, "Unavailable"), self.generation)
+
+
+def _validate_reader_dimensions(reader, max_pixels: int):
+    size = reader.size()
+    if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+        raise ValueError("Unable to determine image dimensions safely.")
+    width, height = int(size.width()), int(size.height())
+    max_dimension = 32_768
+    if width > max_dimension or height > max_dimension or width * height > max_pixels:
+        raise ValueError("Source image exceeds the preview security limit.")
+    return width, height
+
+
+def _read_scaled_image(path: Path, target: QSize, cancel_event=None, max_pixels: int = 50_000_000):
+    """Decode directly at display size where Qt supports it.
+
+    The source remains in a private temporary file; only the small display
+    image is retained in memory. A pixel ceiling prevents decompression-bomb
+    style allocations even when the compressed image itself is small.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    qfile = QFile(str(path))
+    if not qfile.open(QFile.OpenModeFlag.ReadOnly):
+        raise ValueError("Unable to open authenticated preview data.")
+    try:
+        reader = QImageReader(qfile)
+        reader.setAutoTransform(True)
+        source_w, source_h = _validate_reader_dimensions(reader, max_pixels)
+        # Ask Qt for a bounded size with the same aspect ratio. The caller
+        # still applies its original KeepAspectRatio presentation policy, so
+        # the UI appearance remains unchanged. The source dimensions are
+        # validated before read() to prevent decompression-bomb allocations.
+        tw = max(1, target.width())
+        th = max(1, target.height())
+        scale = min(tw / source_w, th / source_h)
+        decode_size = QSize(max(1, int(source_w * scale)), max(1, int(source_h * scale)))
+        reader.setScaledSize(decode_size)
+        image = reader.read()
+        if image.isNull():
+            raise ValueError(reader.errorString() or "Unsupported image")
+        if image.width() * image.height() > max_pixels:
+            raise ValueError("Decoded image exceeds the preview memory limit.")
+        return image
+    finally:
+        qfile.close()
 
 
 class PreviewWindow(QDialog):
-    def __init__(self, source: Path, password: str, parent=None, timeout_minutes: int = 10):
+    def __init__(self, source: Path, session: PreviewSession, parent=None, timeout_minutes: int = 10):
         super().__init__(parent)
-        self.source, self.password = Path(source), password
+        self.source, self.session = Path(source), session
         self.timeout_minutes = max(1, int(timeout_minutes))
         self._image = QImage()
         # A frameless dialog leaves no title bar, filename, controls, or
@@ -184,42 +267,23 @@ class PreviewWindow(QDialog):
         self.timer_label.adjustSize()
         self.timer_label.raise_()
         self._load()
-        return
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(8)
-
-        header = QFrame(); header.setObjectName("card")
-        h = QHBoxLayout(header); h.setContentsMargins(12, 8, 10, 8); h.setSpacing(8)
-        icon = QToolButton(); icon.setIcon(self.style().standardIcon(QStyle.SP_FileIcon)); icon.setEnabled(False); h.addWidget(icon)
-        title_box = QVBoxLayout(); title_box.setSpacing(1)
-        title = QLabel(self.source.name.removesuffix(".aesvault")); title.setObjectName("previewTitle")
-        title_box.addWidget(title)
-        self.meta = QLabel("Authenticating secure image…"); self.meta.setObjectName("muted"); title_box.addWidget(self.meta)
-        h.addLayout(title_box, 1)
-        close = QToolButton(); close.setIcon(self.style().standardIcon(QStyle.SP_DialogCloseButton)); close.setToolTip("Close preview"); close.clicked.connect(self.close); h.addWidget(close)
-        root.addWidget(header)
-
-        canvas = QFrame(); canvas.setObjectName("previewCanvas")
-        cv = QVBoxLayout(canvas); cv.setContentsMargins(8, 8, 8, 8)
-        self.image = QLabel(); self.image.setAlignment(Qt.AlignCenter); self.image.setMinimumSize(400, 360); cv.addWidget(self.image, 1)
-        root.addWidget(canvas, 1)
-
-        footer = QFrame(); footer.setObjectName("card")
-        f = QHBoxLayout(footer); f.setContentsMargins(10, 7, 10, 7)
-        badge = QLabel("✓ AUTHENTICATED"); badge.setObjectName("pill"); f.addWidget(badge)
-        f.addStretch()
-        self.dimensions = QLabel("—"); self.dimensions.setObjectName("muted"); f.addWidget(self.dimensions)
-        done = QPushButton("Close"); done.setIcon(self.style().standardIcon(QStyle.SP_DialogCloseButton)); done.clicked.connect(self.close); f.addWidget(done)
-        root.addWidget(footer)
-        self._load()
 
     def _load(self):
         try:
-            data = decrypt_preview(self.source, self.password, max_bytes=256 * 1024 * 1024)
-            if not self._image.loadFromData(data):
+            # Authenticate and decrypt through the same opened source handle.
+            # The plaintext exists only in the private preview temp file while
+            # Qt decodes it at the display size.
+            with secure_preview_file(
+                self.source, password=self.session.password,
+                max_bytes=256 * 1024 * 1024
+            ) as tmp:
+                target = self.image.size()
+                if target.width() < 100 or target.height() < 100:
+                    target = QSize(980, 700)
+                image = _read_scaled_image(tmp, target, max_pixels=50_000_000)
+            if image is None or image.isNull():
                 raise ValueError("The authenticated image could not be decoded by Qt.")
+            self._image = image
             self._fit_image()
             self._preview_authenticated = True
             return True
@@ -227,8 +291,6 @@ class PreviewWindow(QDialog):
             # Never show a large preview or an error dialog when authentication
             # fails. Clear the in-memory image before closing.
             self._clear_preview()
-            if self.parent() is not None and hasattr(self.parent(), "clear_gallery"):
-                self.parent().clear_gallery(clear_password=True)
             self.reject()
             return False
 
@@ -256,9 +318,9 @@ class PreviewWindow(QDialog):
 
     def _fit_image(self):
         if not self._image.isNull():
-            self.image.setPixmap(QPixmap.fromImage(self._image).scaled(
-                self.image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            ))
+            scaled = self._image.scaled(self.image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.image.setPixmap(QPixmap.fromImage(scaled))
+            del scaled
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -271,7 +333,7 @@ class PreviewWindow(QDialog):
 
     def closeEvent(self, event):
         self._clear_preview()
-        self.password = ""
+        self.session = None
         event.accept()
 
 
@@ -295,7 +357,9 @@ class MediaTile(QFrame):
         lay.addWidget(self.thumb)
 
     def set_thumbnail(self, pix):
-        self.thumb.setPixmap(pix.scaled(self.thumb.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+        # ThumbnailTask already produces the bounded display size; avoid a second
+        # QPixmap allocation here, which otherwise doubles cache/display memory.
+        self.thumb.setPixmap(pix)
 
     def clear_thumbnail(self):
         self.thumb.setPixmap(QPixmap())
@@ -313,7 +377,8 @@ class PreviewPanel(QWidget):
     cache_status_changed = Signal(str)
 
     def __init__(self,parent=None):
-        super().__init__(parent); self.password=""; self.paths=[]; self.loaded=0; self.batch_size=30; self._loading=False; self._tiles={}; self._thumb_cache=OrderedDict(); self._thumb_cache_bytes=0; self._thumb_cache_limit=90*1024*1024; self._thumb_loading=set(); self._cache_loaded_count=0; self._cache_evicted_count=0; self.pool=QThreadPool(self); self.pool.setMaxThreadCount(2); self.signals=ThumbSignals(); self.signals.ready.connect(self._thumbnail_ready); self._preview_deadline=None; self._active_preview=None; self._preview_timer=QTimer(self); self._preview_timer.setInterval(1000); self._preview_timer.timeout.connect(self._tick_global_preview_timer); self._build_ui(); self._cache_limit_changed(self.cache_limit.value())
+        cleanup_stale_preview_files()
+        super().__init__(parent); self._preview_session=None; self.paths=[]; self.loaded=0; self.batch_size=30; self._loading=False; self._tiles={}; self._thumb_cache=OrderedDict(); self._thumb_cache_bytes=0; self._thumb_cache_limit=90*1024*1024; self._thumb_loading={}; self._live_tile_margin_rows=2; self._tile_row_height=137; self._cache_loaded_count=0; self._thumb_cancel_event=Event(); self._generation=0; self._cache_evicted_count=0; self.pool=QThreadPool(self); self.pool.setMaxThreadCount(2); self.signals=ThumbSignals(); self.signals.ready.connect(self._thumbnail_ready); self._preview_deadline=None; self._active_preview=None; self._preview_timer=QTimer(self); self._preview_timer.setInterval(1000); self._preview_timer.timeout.connect(self._tick_global_preview_timer); self._build_ui(); self._cache_limit_changed(self.cache_limit.value())
 
     def _build_ui(self):
         root=QVBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(8)
@@ -353,10 +418,10 @@ class PreviewPanel(QWidget):
         info=QHBoxLayout(); self.count=QLabel("0 items"); self.count.setObjectName("pill"); self.loaded_label=QLabel("0 loaded"); self.loaded_label.setObjectName("muted"); self.hint=QLabel("Select a photo to open the secure full-size viewer"); self.hint.setObjectName("muted"); info.addWidget(self.count); info.addWidget(self.loaded_label); info.addWidget(self.hint,1); root.addLayout(info)
 
         self.scroll=QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame); self.scroll.verticalScrollBar().valueChanged.connect(self._scroll)
-        self.canvas=QWidget(); self.grid=QGridLayout(self.canvas); self.grid.setContentsMargins(2,2,2,18); self.grid.setHorizontalSpacing(9); self.grid.setVerticalSpacing(9); self.scroll.setWidget(self.canvas); root.addWidget(self.scroll,1)
+        self.canvas=QWidget(); self.canvas.setContentsMargins(0,0,0,0); self.scroll.setWidget(self.canvas); root.addWidget(self.scroll,1)
         self.empty=QFrame(); self.empty.setObjectName("emptyState"); el=QVBoxLayout(self.empty); el.setAlignment(Qt.AlignCenter); icon=QLabel(); icon.setPixmap(self.style().standardIcon(QStyle.SP_DirOpenIcon).pixmap(38,38)); icon.setAlignment(Qt.AlignCenter); el.addWidget(icon); msg=QLabel("Your secure gallery is empty"); msg.setObjectName("emptyTitle"); msg.setAlignment(Qt.AlignCenter); el.addWidget(msg); sub=QLabel("Choose an encrypted folder and unlock it with your 4–12 character key."); sub.setObjectName("muted"); sub.setAlignment(Qt.AlignCenter); el.addWidget(sub); root.addWidget(self.empty,1); self.empty.raise_()
 
-    def _password_changed(self,value): self.password=value; self.auth.setEnabled(4 <= len(value) <= 12 and bool(self.folder.text().strip()))
+    def _password_changed(self,value): self.auth.setEnabled(4 <= len(value) <= 12 and bool(self.folder.text().strip()))
     def browse(self):
         folder=QFileDialog.getExistingDirectory(self,"Select encrypted folder")
         if folder:
@@ -370,42 +435,110 @@ class PreviewPanel(QWidget):
         if not folder.is_dir(): QMessageBox.warning(self,"Encrypted folder","Select a valid encrypted folder first."); return
         if not 4 <= len(self.password_edit.text()) <= 12: QMessageBox.warning(self,"Access key","Enter a key between 4 and 12 characters."); return
         password = self.password_edit.text()
-        paths = [p for p in sorted(folder.rglob("*.aesvault")) if media_type(p) == "photo"]
-        if paths:
-            try:
-                # Authenticate before showing any thumbnails or opening previews.
-                decrypt_preview(paths[0], password, max_bytes=256 * 1024 * 1024)
-            except Exception:
-                # Wrong password: silently clear any previously displayed gallery.
-                self.clear_gallery(clear_password=True)
-                return
+        paths = [str(p) for p in sorted(folder.rglob("*.aesvault")) if media_type(p) == "photo"]
+        try:
+            # Authenticate without materializing the first full image. The derived
+            # key becomes the single session key shared by bounded preview tasks.
+            session_key = authenticate_vault(Path(paths[0]), password) if paths else None
+        except Exception:
+            self.clear_gallery(clear_password=True)
+            return
         # Start the single global preview session timer immediately after a
         # successful unlock. It is intentionally independent of the large
         # preview dialog, so time is consumed from the moment the gallery is
         # unlocked rather than from the first image click.
-        self.password=password
+        self._cancel_thumbnail_tasks()
+        self._preview_session=PreviewSession(password)
+        # The first vault has already been authenticated above; the session
+        # derives a separate key for every vault because each file has its own salt.
+        from core.crypto import _wipe
+        _wipe(session_key)
         self._start_global_preview_timer()
-        self.paths=paths; self.loaded=0; self._clear_thumbnail_cache(); self._tiles.clear()
-        while self.grid.count():
-            item=self.grid.takeAt(0); w=item.widget(); w.deleteLater() if w else None
-        self.count.setText(f"{len(self.paths)} photos"); self.empty.setVisible(not bool(self.paths)); self.scroll.setVisible(bool(self.paths)); self.load_more()
+        self.paths=paths; self.loaded=0; self._clear_thumbnail_cache()
+        self._destroy_all_tiles()
+        self.count.setText(f"{len(self.paths)} photos"); self.empty.setVisible(not bool(self.paths)); self.scroll.setVisible(bool(self.paths)); self._update_canvas_geometry(); self.load_more()
 
-    def _columns(self): return max(2, min(8, max(2, self.scroll.viewport().width() // 184)))
+    def _columns(self):
+        return max(2, min(8, max(2, self.scroll.viewport().width() // 184)))
+
+    def _update_canvas_geometry(self):
+        cols = self._columns()
+        rows = (len(self.paths) + cols - 1) // cols
+        width = max(self.scroll.viewport().width(), cols * 184 + 2)
+        height = max(self.scroll.viewport().height(), rows * self._tile_row_height + 20)
+        self.canvas.setMinimumSize(width, height)
+        self.canvas.resize(width, height)
+
+    def _make_tile(self, idx: int):
+        if not (0 <= idx < len(self.paths)):
+            return None
+        path = Path(self.paths[idx])
+        key = str(path)
+        existing = self._tiles.get(key)
+        if existing is not None:
+            return existing
+        tile = MediaTile(path, self.canvas)
+        tile.clicked.connect(self.open_preview)
+        self._tiles[key] = tile
+        size = QSize(162, 112)
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            pix, cache_size = self._thumb_cache.pop(key)
+            self._thumb_cache[key] = (pix, cache_size)
+            tile.set_thumbnail(pix)
+        else:
+            tile.thumb.setPixmap(placeholder(size, "Loading…"))
+            if key not in self._thumb_loading and self._preview_session is not None:
+                self._thumb_loading[key] = self._generation
+                self._emit_cache_status("Loading")
+                self.pool.start(ThumbnailTask(path, self._preview_session, size, self.signals, self._thumb_cancel_event, self._generation))
+        return tile
+
+    def _sync_tile_window(self):
+        if not self.paths or self._preview_session is None:
+            return
+        self._update_canvas_geometry()
+        cols = self._columns()
+        bar_value = self.scroll.verticalScrollBar().value()
+        viewport_h = max(1, self.scroll.viewport().height())
+        first_row = max(0, bar_value // self._tile_row_height - self._live_tile_margin_rows)
+        last_row = min((len(self.paths) + cols - 1) // cols - 1,
+                       (bar_value + viewport_h) // self._tile_row_height + self._live_tile_margin_rows)
+        wanted = set()
+        for row in range(first_row, last_row + 1):
+            for col in range(cols):
+                idx = row * cols + col
+                if idx >= len(self.paths):
+                    break
+                wanted.add(str(self.paths[idx]))
+                tile = self._make_tile(idx)
+                if tile is not None:
+                    tile.setGeometry(2 + col * 184, 2 + row * self._tile_row_height, 174, 128)
+                    tile.show()
+
+        # Keep only a small viewport neighborhood of QWidget/QPixmap objects.
+        # The thumbnail cache remains independent and bounded by bytes.
+        for key in list(self._tiles):
+            if key not in wanted:
+                tile = self._tiles.pop(key)
+                try:
+                    tile.clear_thumbnail()
+                    tile.hide()
+                    tile.deleteLater()
+                except RuntimeError:
+                    pass
+
+        self.loaded = max(self.loaded, min(len(self.paths), (last_row + 1) * cols))
+        self.loaded_label.setText(f"{self.loaded} / {len(self.paths)} shown")
+
     def load_more(self):
-        if self._loading or self.loaded>=len(self.paths): return
-        self._loading=True; end=min(self.loaded+self.batch_size,len(self.paths)); cols=self._columns()
-        for idx,path in enumerate(self.paths[self.loaded:end],start=self.loaded):
-            tile=MediaTile(path); tile.clicked.connect(self.open_preview); self._tiles[str(path)]=tile; self.grid.addWidget(tile,idx//cols,idx%cols)
-            size=QSize(162,112); key=str(path)
-            if key in self._thumb_cache:
-                pix, _bytes = self._thumb_cache.pop(key); self._thumb_cache[key]=(pix, _bytes); tile.set_thumbnail(pix)
-            else:
-                tile.thumb.setPixmap(placeholder(size, "Loading…"))
-                if key not in self._thumb_loading:
-                    self._thumb_loading.add(key)
-                    self._emit_cache_status("Loading")
-                    self.pool.start(ThumbnailTask(path,self.password,size,self.signals))
-        self.loaded=end; self.loaded_label.setText(f"{self.loaded} / {len(self.paths)} shown"); self._loading=False
+        if self._loading or self.loaded >= len(self.paths):
+            self._sync_tile_window()
+            return
+        self._loading = True
+        self.loaded = min(self.loaded + self.batch_size, len(self.paths))
+        self._sync_tile_window()
+        self._loading = False
 
     def _emit_cache_status(self, event="Ready"):
         used_mb = self._thumb_cache_bytes / (1024 * 1024)
@@ -430,9 +563,12 @@ class PreviewPanel(QWidget):
 
     def _pixmap_bytes(self, pix):
         try:
-            return max(1, int(pix.toImage().sizeInBytes()))
+            dpr = max(1.0, float(pix.devicePixelRatio()))
         except Exception:
-            return max(1, pix.width() * pix.height() * 4)
+            dpr = 1.0
+        # Conservative upper bound for a 32-bit decoded pixmap; avoids creating
+        # a temporary QImage just to measure cache usage.
+        return max(1, int(pix.width() * pix.height() * 4 * dpr * dpr))
 
     def _trim_thumbnail_cache(self):
         evicted = 0
@@ -447,11 +583,20 @@ class PreviewPanel(QWidget):
             self._cache_evicted_count += evicted
             self._emit_cache_status(f"Unloaded {evicted}")
 
-    def _thumbnail_ready(self,key,pix):
-        self._thumb_loading.discard(key)
-        if key not in self._tiles:
-            self._emit_cache_status("Released")
+    def _thumbnail_ready(self,key,pix,generation):
+        if generation != self._generation:
+            # Only clear the loading marker if it still belongs to this stale
+            # generation. A newer generation may already be decoding the same
+            # path and must not be suppressed by an old callback.
+            if self._thumb_loading.get(key) == generation:
+                self._thumb_loading.pop(key, None)
+            pix = QPixmap()
             return
+        if self._thumb_loading.get(key) == generation:
+            self._thumb_loading.pop(key, None)
+        # Cache the completed thumbnail even if the tile scrolled off-screen
+        # while decoding. This prevents duplicate jobs when the user scrolls
+        # back quickly and keeps widget lifetime independent of decode lifetime.
         size = self._pixmap_bytes(pix)
         old = self._thumb_cache.pop(key, None)
         if old is not None:
@@ -460,40 +605,25 @@ class PreviewPanel(QWidget):
         self._thumb_cache_bytes += size
         self._cache_loaded_count += 1
         self._trim_thumbnail_cache()
-        self._emit_cache_status("Loaded")
+        self._emit_cache_status("Loaded" if key in self._tiles else "Cached")
         tile=self._tiles.get(key)
         if tile:
-            # It may have been evicted immediately if the configured limit is tiny.
             cached=self._thumb_cache.get(key)
             if cached is not None:
                 tile.set_thumbnail(cached[0])
 
     def _refresh_visible_thumbnails(self):
-        viewport = self.scroll.viewport()
-        view_rect = viewport.rect()
-        for key, tile in self._tiles.items():
-            if tile.geometry().intersects(view_rect.translated(0, self.scroll.verticalScrollBar().value())):
-                cached = self._thumb_cache.get(key)
-                if cached is not None:
-                    pix, size = self._thumb_cache.pop(key); self._thumb_cache[key]=(pix,size); tile.set_thumbnail(pix)
-                elif key not in self._thumb_loading:
-                    tile.thumb.setPixmap(placeholder(tile.thumb.size(), "Loading…"))
-                    self._thumb_loading.add(key)
-                    self.pool.start(ThumbnailTask(Path(key),self.password,tile.thumb.size(),self.signals))
+        self._sync_tile_window()
 
-    def _scroll(self,value):
-        bar=self.scroll.verticalScrollBar()
-        if value>=bar.maximum()-max(260,self.scroll.viewport().height()): self.load_more()
-        self._refresh_visible_thumbnails()
+    def _scroll(self, value):
+        # The canvas represents the whole gallery, while only a small viewport
+        # neighborhood is materialized as QWidget objects.
+        self._sync_tile_window()
 
-    def resizeEvent(self,event):
+    def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.paths and self.loaded:
-            # Reflow existing tiles compactly as the window changes size.
-            cols=self._columns()
-            for i,path in enumerate(self.paths[:self.loaded]):
-                tile=self._tiles.get(str(path))
-                if tile: self.grid.addWidget(tile,i//cols,i%cols)
+        if self.paths:
+            self._sync_tile_window()
 
     def _start_global_preview_timer(self):
         if self._preview_deadline is None:
@@ -526,26 +656,46 @@ class PreviewPanel(QWidget):
             return
         self._update_active_preview_timer()
 
+    def _destroy_all_tiles(self):
+        for tile in list(self._tiles.values()):
+            try:
+                tile.clear_thumbnail()
+                tile.hide()
+                tile.deleteLater()
+            except RuntimeError:
+                pass
+        self._tiles.clear()
+
+    def _cancel_thumbnail_tasks(self):
+        try:
+            self._thumb_cancel_event.set()
+            self.pool.clear()
+        except Exception:
+            pass
+        self._thumb_cancel_event = Event()
+        self._generation += 1
+
     def clear_gallery(self, clear_password=True):
         # Remove all decrypted/in-memory preview state and thumbnails.
+        self._cancel_thumbnail_tasks()
         self._preview_timer.stop()
         self._preview_deadline = None
         self.preview_timer_finished.emit()
         if self._active_preview is not None:
             self._active_preview._clear_preview()
             self._active_preview = None
-        self.password = ""
+        if self._preview_session is not None:
+            try:
+                self._preview_session.close()
+            except Exception:
+                pass
+            self._preview_session = None
         self.paths = []
         self.loaded = 0
         self._loading = False
         self._clear_thumbnail_cache()
         self._thumb_loading.clear()
-        self._tiles.clear()
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        self._destroy_all_tiles()
         self.count.setText("0 items")
         self.loaded_label.setText("0 loaded")
         self.empty.setVisible(True)
@@ -554,13 +704,21 @@ class PreviewPanel(QWidget):
             self.password_edit.clear()
         self.auth.setEnabled(4 <= len(self.password_edit.text()) <= 12 and bool(self.folder.text().strip()))
 
+    def closeEvent(self, event):
+        self.clear_gallery(clear_password=True)
+        try:
+            self.pool.waitForDone(2000)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def open_preview(self,path):
         # One global preview window timer for the whole gallery session.
         # Opening another item never resets the deadline.
         if self._preview_deadline is not None and time.monotonic() >= self._preview_deadline:
             self.clear_gallery(clear_password=True)
             return
-        dialog = PreviewWindow(Path(path),self.password,self,self.timeout.value())
+        dialog = PreviewWindow(Path(path),self._preview_session,self,self.timeout.value())
         if not dialog._preview_authenticated:
             return
         self._active_preview = dialog

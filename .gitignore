@@ -2,3 +2,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Security/build artifacts
+.venv/
+.env
+*.log
+*.tmp
+*.aesvault
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.md
+*.docx

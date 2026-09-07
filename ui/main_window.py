@@ -506,6 +506,11 @@ class MainWindow(QMainWindow):
             page.progress.setValue(100)
             page.percent.setText("100%")
         page.status.setText(f"Finished • {successful} succeeded • {failed} failed")
+        # Do not retain transfer credentials after the worker has stopped.
+        # The UI remains visually unchanged; the password field simply becomes
+        # blank so a secret is not left resident for the lifetime of the app.
+        page.password.clear()
+        self.worker.password = "" if self.worker is not None else ""
 
         errors = getattr(self, "_job_errors", [])
         if errors:
