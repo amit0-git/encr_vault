@@ -4,8 +4,8 @@ from ui.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("AES Vault")
-    app.setOrganizationName("AES Vault")
+    app.setApplicationName("Encrvault")
+    app.setOrganizationName("Encrvault")
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
