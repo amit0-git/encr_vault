@@ -89,18 +89,22 @@ class FolderCard(QFrame):
         super().__init__(parent)
         self.setObjectName("card")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(7)
         label = QLabel(title)
-        label.setStyleSheet("font-size:16px;font-weight:800")
+        label.setStyleSheet("font-size:13px;font-weight:800")
         desc = QLabel(hint)
         desc.setObjectName("muted")
         self.edit = QLineEdit()
         self.edit.setReadOnly(True)
-        self.edit.setPlaceholderText("Select a folder…")
+        self.edit.setPlaceholderText("Choose a folder…")
+        self.edit.setMinimumHeight(40)
         browse = QPushButton("Browse")
+        browse.setMinimumHeight(40)
+        browse.setFixedWidth(78)
         browse.clicked.connect(self.browse)
         row = QHBoxLayout()
+        row.setSpacing(7)
         row.addWidget(self.edit, 1)
         row.addWidget(browse)
         layout.addWidget(label)
@@ -234,93 +238,128 @@ class MainWindow(QMainWindow):
         return b
 
     def build_transfer_page(self, mode):
+        # Balanced compact layout: fewer elements, but enough spacing and hierarchy
+        # that the transfer screen still feels like a finished desktop application.
         page = QWidget()
         root = QVBoxLayout(page)
-        root.setContentsMargins(0, 0, 0, 0)
+        root.setContentsMargins(0, 4, 0, 0)
         root.setSpacing(14)
 
-        metrics = QHBoxLayout()
-        for value, label in [("AES-256", "Cipher"), ("6", "Max key chars"), ("∞", "Media capacity")]:
-            card = QFrame()
-            card.setObjectName("card")
-            box = QVBoxLayout(card)
-            box.setContentsMargins(16, 13, 16, 13)
-            v = QLabel(value)
-            v.setObjectName("metric")
-            l = QLabel(label)
-            l.setObjectName("metricLabel")
-            box.addWidget(v)
-            box.addWidget(l)
-            metrics.addWidget(card)
-        root.addLayout(metrics)
+        # Security / key card
+        security = QFrame()
+        security.setObjectName("card")
+        sec = QVBoxLayout(security)
+        sec.setContentsMargins(18, 15, 18, 15)
+        sec.setSpacing(10)
 
-        key = QFrame()
-        key.setObjectName("card")
-        kl = QVBoxLayout(key)
-        kl.setContentsMargins(14, 12, 14, 12)
-        heading = QLabel("Access key")
-        heading.setStyleSheet("font-size:16px;font-weight:800")
-        hint = QLabel("Use a 6-character key. The key is processed locally and is never written to disk.")
-        hint.setObjectName("muted")
-        row = QHBoxLayout()
+        sec_head = QHBoxLayout()
+        key_title = QLabel("Access key")
+        key_title.setStyleSheet("font-size:15px;font-weight:800")
+        key_hint = QLabel("6 characters • used locally")
+        key_hint.setObjectName("muted")
+        sec_head.addWidget(key_title)
+        sec_head.addSpacing(8)
+        sec_head.addWidget(key_hint)
+        sec_head.addStretch()
+        workers_label = QLabel("Parallel workers")
+        workers_label.setObjectName("muted")
+        sec_head.addWidget(workers_label)
+        workers = QSpinBox()
+        cpu = os.cpu_count() or 1
+        workers.setRange(1, cpu)
+        workers.setValue(min(cpu, 4))
+        workers.setFixedWidth(68)
+        sec_head.addWidget(workers)
+        sec.addLayout(sec_head)
+
+        key_row = QHBoxLayout()
+        key_row.setSpacing(8)
         password = QLineEdit()
         password.setMaxLength(6)
         password.setEchoMode(QLineEdit.Password)
-        password.setPlaceholderText("Exactly 6 characters")
+        password.setPlaceholderText("Enter your 6-character access key")
+        password.setMinimumHeight(42)
         show = QPushButton("Show")
         show.setCheckable(True)
+        show.setFixedWidth(72)
         show.toggled.connect(lambda x: password.setEchoMode(QLineEdit.Normal if x else QLineEdit.Password))
-        row.addWidget(password, 1)
-        row.addWidget(show)
-        kl.addWidget(heading)
-        kl.addWidget(hint)
-        kl.addLayout(row)
-        root.addWidget(key)
+        key_row.addWidget(password, 1)
+        key_row.addWidget(show)
+        sec.addLayout(key_row)
+        root.addWidget(security)
         page.password = password
+        page.workers = workers
+
+        # Folder selection card
+        folders = QFrame()
+        folders.setObjectName("card")
+        fl = QVBoxLayout(folders)
+        fl.setContentsMargins(18, 15, 18, 15)
+        fl.setSpacing(10)
+        folder_title = QLabel("Folders")
+        folder_title.setStyleSheet("font-size:15px;font-weight:800")
+        fl.addWidget(folder_title)
 
         grid = QGridLayout()
-        grid.setSpacing(14)
-        page.input_card = FolderCard("Input folder", "Source media for encryption or .aesvault files for decryption.")
-        page.output_card = FolderCard("Output folder", "A separate destination keeps originals untouched.")
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+        page.input_card = FolderCard(
+            "Input folder",
+            "Photos and videos" if mode == "encrypt" else "Encrypted .aesvault files",
+        )
+        page.output_card = FolderCard(
+            "Output folder",
+            "Encrypted copies" if mode == "encrypt" else "Restored media",
+        )
         grid.addWidget(page.input_card, 0, 0)
         grid.addWidget(page.output_card, 0, 1)
-        root.addLayout(grid)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        fl.addLayout(grid)
+        root.addWidget(folders)
 
-        performance = QFrame()
-        performance.setObjectName("card")
-        pl = QHBoxLayout(performance)
-        pl.setContentsMargins(14, 10, 14, 10)
-        pl.addWidget(QLabel("Parallel workers"))
-        page.workers = QSpinBox()
-        cpu = os.cpu_count() or 1
-        page.workers.setRange(1, cpu)
-        page.workers.setValue(min(cpu, 4))
-        pl.addWidget(page.workers)
-        note = QLabel("Independent files are processed concurrently • chunked I/O limits memory usage")
-        note.setObjectName("muted")
-        pl.addWidget(note, 1)
-        root.addWidget(performance)
-
-        status = QLabel("Ready")
+        # Progress is deliberately quiet until a job starts.
+        progress_card = QFrame()
+        progress_card.setObjectName("card")
+        pl = QVBoxLayout(progress_card)
+        pl.setContentsMargins(18, 13, 18, 13)
+        pl.setSpacing(8)
+        status_row = QHBoxLayout()
+        status = QLabel("Ready to start")
         status.setObjectName("muted")
+        percent = QLabel("0%")
+        percent.setObjectName("muted")
+        status_row.addWidget(status)
+        status_row.addStretch()
+        status_row.addWidget(percent)
+        pl.addLayout(status_row)
         progress = QProgressBar()
         progress.setValue(0)
-        root.addWidget(status)
-        root.addWidget(progress)
+        progress.setTextVisible(False)
+        progress.setMinimumHeight(9)
+        pl.addWidget(progress)
+        root.addWidget(progress_card)
         page.status = status
+        page.percent = percent
         page.progress = progress
 
+        # Primary action is visually dominant; cancel remains secondary.
         actions = QHBoxLayout()
-        start = QPushButton("Start encryption" if mode == "encrypt" else "Start decryption")
+        actions.setSpacing(10)
+        start = QPushButton("Encrypt files" if mode == "encrypt" else "Decrypt files")
         start.setObjectName("primary")
+        start.setMinimumHeight(46)
         cancel = QPushButton("Cancel")
         cancel.setObjectName("danger")
+        cancel.setMinimumHeight(46)
+        cancel.setFixedWidth(110)
         cancel.setEnabled(False)
         start.clicked.connect(lambda: self.start_job(mode))
         cancel.clicked.connect(self.cancel_job)
         actions.addWidget(start, 1)
         actions.addWidget(cancel)
         root.addLayout(actions)
+        root.addStretch(1)
         page.start = start
         page.cancel = cancel
         return page
@@ -373,6 +412,7 @@ class MainWindow(QMainWindow):
         page.cancel.setEnabled(True)
         page.password.setEnabled(False)
         page.progress.setValue(0)
+        page.percent.setText("0%")
         page.status.setText("Starting…")
         self.thread = QThread(self)
         self.worker = FileWorker(mode, inp, out, password, page.workers.value())
@@ -392,6 +432,7 @@ class MainWindow(QMainWindow):
         page = self.active_page
         value = int(done * 100 / total) if total else 0
         page.progress.setValue(value)
+        page.percent.setText(f"{value}%")
         action = "Decrypting" if self.mode == "decrypt" else "Encrypting"
         page.status.setText(f"{action} {Path(name).name} • {value}%")
 
@@ -406,6 +447,7 @@ class MainWindow(QMainWindow):
         page.password.setEnabled(True)
         if failed == 0 and successful:
             page.progress.setValue(100)
+            page.percent.setText("100%")
         page.status.setText(f"Finished • {successful} succeeded • {failed} failed")
 
     def cancel_job(self):
