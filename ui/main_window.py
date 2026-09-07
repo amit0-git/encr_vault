@@ -3,105 +3,71 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
-from core.worker import EncryptionWorker
+from core.worker import FileWorker
 
 
-STYLE = """
-QMainWindow, QWidget {
-    background: #0e111a;
-    color: #e9edf7;
-    font-family: "Segoe UI";
-    font-size: 13px;
-}
-QFrame#card {
-    background: #151a26;
-    border: 1px solid #242b3a;
-    border-radius: 14px;
-}
-QLabel#brand {
-    font-size: 22px;
-    font-weight: 700;
-}
-QLabel#title {
-    font-size: 30px;
-    font-weight: 700;
-}
-QLabel#muted {
-    color: #929bad;
-}
-QLineEdit, QSpinBox {
-    background: #0b0e15;
-    border: 1px solid #2b3344;
-    border-radius: 9px;
-    padding: 10px;
-    color: #e9edf7;
-}
-QLineEdit:focus, QSpinBox:focus {
-    border: 1px solid #2ec5ff;
-}
-QPushButton {
-    background: #20283a;
-    border: 1px solid #303a50;
-    border-radius: 9px;
-    padding: 10px 16px;
-    font-weight: 600;
-}
-QPushButton:hover {
-    background: #29344a;
-}
-QPushButton#primary {
-    background: #1f8fb7;
-    border: none;
-    min-height: 44px;
-    font-size: 15px;
-}
-QPushButton#primary:hover {
-    background: #27a6d3;
-}
-QPushButton:disabled {
-    color: #687184;
-}
-QProgressBar {
-    background: #0a0d13;
-    border: none;
-    border-radius: 6px;
-    height: 12px;
-    text-align: center;
-}
-QProgressBar::chunk {
-    background: #2ec5ff;
-    border-radius: 6px;
-}
+DARK = """
+QMainWindow,QWidget{background:#0e111a;color:#e9edf7;font-family:"Segoe UI";font-size:13px}
+QFrame#card{background:#151a26;border:1px solid #242b3a;border-radius:14px}
+QLabel#brand{font-size:22px;font-weight:700}
+QLabel#title{font-size:30px;font-weight:700}
+QLabel#muted{color:#929bad}
+QLineEdit,QSpinBox{background:#0b0e15;border:1px solid #2b3344;border-radius:9px;padding:10px;color:#e9edf7}
+QLineEdit:focus,QSpinBox:focus{border:1px solid #2ec5ff}
+QPushButton{background:#20283a;border:1px solid #303a50;border-radius:9px;padding:10px 16px;font-weight:600}
+QPushButton:hover{background:#29344a}
+QPushButton#primary{background:#1f8fb7;border:none;min-height:44px;font-size:15px}
+QPushButton#primary:hover{background:#27a6d3}
+QPushButton:disabled{color:#687184}
+QProgressBar{background:#0a0d13;border:none;border-radius:6px;height:12px}
+QProgressBar::chunk{background:#2ec5ff;border-radius:6px}
 """
 
-class FolderRow(QFrame):
-    def __init__(self, title: str, placeholder: str, parent=None):
+LIGHT = """
+QMainWindow,QWidget{background:#f5f7fb;color:#182033;font-family:"Segoe UI";font-size:13px}
+QFrame#card{background:#ffffff;border:1px solid #dfe4ee;border-radius:14px}
+QLabel#brand{font-size:22px;font-weight:700}
+QLabel#title{font-size:30px;font-weight:700}
+QLabel#muted{color:#667085}
+QLineEdit,QSpinBox{background:#f8fafc;border:1px solid #cbd3e1;border-radius:9px;padding:10px;color:#182033}
+QLineEdit:focus,QSpinBox:focus{border:1px solid #178ab5}
+QPushButton{background:#e9edf4;border:1px solid #cbd3e1;border-radius:9px;padding:10px 16px;font-weight:600}
+QPushButton:hover{background:#dde4ef}
+QPushButton#primary{background:#178ab5;color:white;border:none;min-height:44px;font-size:15px}
+QPushButton#primary:hover{background:#126f92}
+QProgressBar{background:#e5e9f0;border:none;border-radius:6px;height:12px}
+QProgressBar::chunk{background:#178ab5;border-radius:6px}
+"""
+
+
+class FolderCard(QFrame):
+    def __init__(self, title, hint, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(10)
         label = QLabel(title)
-        label.setStyleSheet("font-size:18px;font-weight:700;")
-        hint = QLabel(placeholder)
-        hint.setObjectName("muted")
+        label.setStyleSheet("font-size:18px;font-weight:700")
+        description = QLabel(hint)
+        description.setObjectName("muted")
         self.edit = QLineEdit()
         self.edit.setReadOnly(True)
         self.edit.setPlaceholderText("Select a folder…")
-        button = QPushButton("Browse")
-        button.clicked.connect(self.browse)
+        browse = QPushButton("Browse")
+        browse.clicked.connect(self.browse)
         row = QHBoxLayout()
         row.addWidget(self.edit, 1)
-        row.addWidget(button)
+        row.addWidget(browse)
         layout.addWidget(label)
-        layout.addWidget(hint)
+        layout.addWidget(description)
         layout.addLayout(row)
 
     def browse(self):
@@ -115,10 +81,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.thread = None
         self.worker = None
+        self.dark = True
+        self.mode = "encrypt"
         self.setWindowTitle("AES Vault — Secure Media Encryption")
-        self.setMinimumSize(920, 680)
+        self.setMinimumSize(900, 650)
         self.resize(1180, 800)
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(DARK)
         self.build_ui()
 
     def build_ui(self):
@@ -126,209 +94,235 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(32, 28, 32, 28)
-        root.setSpacing(18)
+        root.setSpacing(16)
 
         header = QHBoxLayout()
         brand = QLabel("AES VAULT")
         brand.setObjectName("brand")
         header.addWidget(brand)
         header.addStretch()
-        security = QLabel("●  AES-256-GCM  •  Local processing")
-        security.setStyleSheet("color:#6ee7a0;font-weight:600;")
-        header.addWidget(security)
+        self.theme = QPushButton("☀  Light")
+        self.theme.setCheckable(True)
+        self.theme.clicked.connect(self.toggle_theme)
+        header.addWidget(self.theme)
         root.addLayout(header)
 
+        title_row = QHBoxLayout()
         title = QLabel("Encrypt media")
         title.setObjectName("title")
-        root.addWidget(title)
-        sub = QLabel("Batch-protect photos and videos without modifying your originals.")
-        sub.setObjectName("muted")
-        root.addWidget(sub)
+        self.title = title
+        title_row.addWidget(title)
+        title_row.addStretch()
+        self.encrypt_tab = QPushButton("Encrypt")
+        self.decrypt_tab = QPushButton("Decrypt")
+        self.encrypt_tab.clicked.connect(lambda: self.set_mode("encrypt"))
+        self.decrypt_tab.clicked.connect(lambda: self.set_mode("decrypt"))
+        title_row.addWidget(self.encrypt_tab)
+        title_row.addWidget(self.decrypt_tab)
+        root.addLayout(title_row)
 
-        key_card = QFrame()
-        key_card.setObjectName("card")
-        key_layout = QVBoxLayout(key_card)
-        key_layout.setContentsMargins(20, 18, 20, 18)
-        key_label = QLabel("Encryption key / password")
-        key_label.setStyleSheet("font-weight:700;")
-        key_layout.addWidget(key_label)
+        self.subtitle = QLabel("Batch-protect photos and videos without modifying your originals.")
+        self.subtitle.setObjectName("muted")
+        root.addWidget(self.subtitle)
+
+        key = QFrame()
+        key.setObjectName("card")
+        key_layout = QVBoxLayout(key)
+        key_layout.setContentsMargins(20, 16, 20, 16)
+        key_layout.addWidget(QLabel("Encryption key / password"))
         key_row = QHBoxLayout()
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.Password)
-        self.password.setPlaceholderText("Use a strong password; Argon2id derives the AES-256 key.")
-        self.show_key = QPushButton("Show")
-        self.show_key.setCheckable(True)
-        self.show_key.toggled.connect(
-            lambda checked: self.password.setEchoMode(
-                QLineEdit.Normal if checked else QLineEdit.Password
+        self.password.setPlaceholderText("Strong password — Argon2id derives the AES-256 key.")
+        self.show_password = QPushButton("Show")
+        self.show_password.setCheckable(True)
+        self.show_password.toggled.connect(
+            lambda x: self.password.setEchoMode(
+                QLineEdit.Normal if x else QLineEdit.Password
             )
         )
         key_row.addWidget(self.password, 1)
-        key_row.addWidget(self.show_key)
+        key_row.addWidget(self.show_password)
         key_layout.addLayout(key_row)
-        root.addWidget(key_card)
+        root.addWidget(key)
 
         grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(16)
-        self.input_row = FolderRow(
+        grid.setSpacing(16)
+        self.input_card = FolderCard(
             "Input folder",
-            "Supported: JPG, PNG, HEIC, MP4, MOV, MKV and common media formats.",
+            "Encrypt mode: source media. Decrypt mode: .aesvault files."
         )
-        self.output_row = FolderRow(
+        self.output_card = FolderCard(
             "Output folder",
-            "Encrypted files preserve the input folder structure and receive .aesvault.",
+            "Original files are never overwritten."
         )
-        grid.addWidget(self.input_row, 0, 0)
-        grid.addWidget(self.output_row, 0, 1)
+        grid.addWidget(self.input_card, 0, 0)
+        grid.addWidget(self.output_card, 0, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         root.addLayout(grid)
 
-        perf = QFrame()
-        perf.setObjectName("card")
-        perf_layout = QHBoxLayout(perf)
-        perf_layout.setContentsMargins(20, 16, 20, 16)
-        workers_label = QLabel("Parallel workers")
-        workers_label.setStyleSheet("font-weight:700;")
+        performance = QFrame()
+        performance.setObjectName("card")
+        p = QHBoxLayout(performance)
+        p.setContentsMargins(20, 14, 20, 14)
+        p.addWidget(QLabel("Parallel workers"))
         self.workers = QSpinBox()
         cpu = os.cpu_count() or 1
-        self.workers.setRange(1, max(1, cpu))
-        self.workers.setValue(max(1, min(cpu, 4)))
-        self.workers.setToolTip("Number of files encrypted concurrently.")
-        perf_layout.addWidget(workers_label)
-        perf_layout.addWidget(self.workers)
-        perf_layout.addSpacing(20)
-        perf_hint = QLabel(
-            "Files are processed concurrently with bounded memory. "
-            "For large media, more workers are not always faster."
+        self.workers.setRange(1, cpu)
+        self.workers.setValue(min(cpu, 4))
+        p.addWidget(self.workers)
+        note = QLabel(
+            "Concurrent file processing • bounded memory • CPU-aware"
         )
-        perf_hint.setObjectName("muted")
-        perf_layout.addWidget(perf_hint, 1)
-        root.addWidget(perf)
+        note.setObjectName("muted")
+        p.addWidget(note, 1)
+        root.addWidget(performance)
 
-        self.progress_label = QLabel("Ready")
-        self.progress_label.setObjectName("muted")
-        root.addWidget(self.progress_label)
+        self.status = QLabel("Ready")
+        self.status.setObjectName("muted")
+        root.addWidget(self.status)
         self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
         self.progress.setValue(0)
         root.addWidget(self.progress)
 
+        actions = QHBoxLayout()
         self.start = QPushButton("Start encryption")
         self.start.setObjectName("primary")
-        self.start.clicked.connect(self.start_encryption)
+        self.start.clicked.connect(self.start_job)
         self.cancel = QPushButton("Cancel")
         self.cancel.setEnabled(False)
-        self.cancel.clicked.connect(self.cancel_encryption)
-
-        actions = QHBoxLayout()
+        self.cancel.clicked.connect(self.cancel_job)
         actions.addWidget(self.start, 1)
         actions.addWidget(self.cancel)
         root.addLayout(actions)
 
-        footer = QLabel("Original files are read-only from AES Vault. No network upload is performed.")
+        footer = QLabel(
+            "AES-256-GCM • Authenticated chunks • Local processing • Originals preserved"
+        )
         footer.setObjectName("muted")
         root.addWidget(footer)
 
-    def start_encryption(self):
-        input_dir = self.input_row.edit.text().strip()
-        output_dir = self.output_row.edit.text().strip()
+        self.set_mode("encrypt")
+
+    def set_mode(self, mode):
+        if self.worker:
+            return
+        self.mode = mode
+        decrypt = mode == "decrypt"
+        self.title.setText("Decrypt media" if decrypt else "Encrypt media")
+        self.subtitle.setText(
+            "Restore authenticated .aesvault files to their original media."
+            if decrypt else
+            "Batch-protect photos and videos without modifying your originals."
+        )
+        self.start.setText("Start decryption" if decrypt else "Start encryption")
+        self.input_card.edit.clear()
+        self.output_card.edit.clear()
+        self.progress.setValue(0)
+        self.status.setText("Ready")
+        self.encrypt_tab.setEnabled(decrypt)
+        self.decrypt_tab.setEnabled(not decrypt)
+
+    def toggle_theme(self):
+        self.dark = not self.dark
+        self.setStyleSheet(DARK if self.dark else LIGHT)
+        self.theme.setText("☀  Light" if self.dark else "☾  Dark")
+
+    def start_job(self):
+        inp = self.input_card.edit.text().strip()
+        out = self.output_card.edit.text().strip()
         password = self.password.text()
 
-        if not input_dir or not Path(input_dir).is_dir():
-            QMessageBox.warning(self, "Input folder", "Please select a valid input folder.")
+        if not inp or not Path(inp).is_dir():
+            QMessageBox.warning(self, "Input folder", "Select a valid input folder.")
             return
-        if not output_dir:
-            QMessageBox.warning(self, "Output folder", "Please select an output folder.")
+        if not out:
+            QMessageBox.warning(self, "Output folder", "Select an output folder.")
             return
-        if Path(input_dir).resolve() == Path(output_dir).resolve():
-            QMessageBox.warning(
-                self, "Output folder",
-                "Input and output folders must be different."
-            )
+        if Path(inp).resolve() == Path(out).resolve():
+            QMessageBox.warning(self, "Folders", "Input and output folders must differ.")
             return
         if len(password) < 12:
             QMessageBox.warning(
-                self, "Weak key",
+                self, "Weak password",
                 "Use a strong password of at least 12 characters."
             )
             return
 
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-
+        Path(out).mkdir(parents=True, exist_ok=True)
         self.start.setEnabled(False)
         self.cancel.setEnabled(True)
+        self.password.setEnabled(False)
         self.progress.setValue(0)
-        self.progress_label.setText("Scanning media…")
+        self.status.setText("Starting…")
 
         self.thread = QThread(self)
-        self.worker = EncryptionWorker(
-            input_dir,
-            output_dir,
-            password,
-            self.workers.value(),
+        self.worker = FileWorker(
+            self.mode, inp, out, password, self.workers.value()
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.on_progress)
         self.worker.file_done.connect(
-            lambda name: self.progress_label.setText(f"Encrypted: {Path(name).name}")
+            lambda name: self.status.setText(f"Completed: {Path(name).name}")
         )
         self.worker.error.connect(self.on_error)
-        self.worker.finished.connect(self.on_finished)
         self.worker.cancelled.connect(
-            lambda: self.progress_label.setText("Cancellation requested…")
+            lambda: self.status.setText("Cancellation requested…")
         )
+        self.worker.finished.connect(self.on_finished)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.finished.connect(self.cleanup_thread)
+        self.thread.finished.connect(self.thread_done)
         self.thread.start()
 
-    def on_progress(self, done, total, filename):
-        percent = int(done * 100 / total) if total else 0
-        self.progress.setValue(percent)
-        self.progress_label.setText(f"Encrypting {Path(filename).name}  •  {percent}%")
+    def on_progress(self, done, total, name):
+        value = int(done * 100 / total) if total else 0
+        self.progress.setValue(value)
+        self.status.setText(
+            f"{'Decrypting' if self.mode == 'decrypt' else 'Encrypting'} "
+            f"{Path(name).name} • {value}%"
+        )
 
     def on_error(self, message):
-        self.progress_label.setText("Completed with errors.")
-        QMessageBox.warning(self, "Encryption error", message)
+        self.status.setText("Completed with errors.")
+        QMessageBox.warning(self, "File processing error", message)
 
     def on_finished(self, successful, failed):
         self.cancel.setEnabled(False)
         self.start.setEnabled(True)
-        self.progress.setValue(100 if failed == 0 else self.progress.value())
-        self.progress_label.setText(
-            f"Finished • {successful} encrypted • {failed} failed"
+        self.password.setEnabled(True)
+        self.progress.setValue(100 if failed == 0 and successful else self.progress.value())
+        self.status.setText(
+            f"Finished • {successful} succeeded • {failed} failed"
         )
-        self.worker = None
-        self.thread = None
 
-    def cancel_encryption(self):
+    def cancel_job(self):
         if self.worker:
             self.worker.cancel()
             self.cancel.setEnabled(False)
-            self.progress_label.setText("Stopping after active files finish…")
+            self.status.setText("Stopping active work…")
 
-    def cleanup_thread(self):
+    def thread_done(self):
+        self.worker = None
         self.thread = None
 
     def closeEvent(self, event):
         if self.worker:
             self.worker.cancel()
-            event.ignore()
             QMessageBox.information(
-                self,
-                "Encryption running",
-                "Cancellation has been requested. Close the application after the job finishes.",
+                self, "Job running",
+                "Cancellation was requested. Please wait for active files to finish."
             )
+            event.ignore()
         else:
             event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication([])
-    window = MainWindow()
-    window.show()
+    win = MainWindow()
+    win.show()
     app.exec()
