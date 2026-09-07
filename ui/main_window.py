@@ -25,6 +25,9 @@ QLabel#title{font-size:25px;font-weight:800}
 QLabel#subtitle,QLabel#muted{color:#8995ad}
 QLabel#metric{font-size:25px;font-weight:800}
 QLabel#metricLabel{color:#8995ad;font-size:11px}
+QLabel#previewSessionCaption{color:#6f7e96;font-size:9px;font-weight:800;letter-spacing:1px}
+QLabel#previewSidebarTimer{background:#101b2e;border:1px solid #2f496a;border-radius:12px;padding:8px 10px;color:#78e7db;font-weight:800;font-size:12px;letter-spacing:.2px}
+QLabel#previewCacheStatus{background:#0d1627;border:1px solid #253652;border-radius:10px;padding:8px;color:#a8b5c9;font-size:10px;line-height:1.25}
 QLabel#pill{background:#17243a;border:1px solid #29415f;border-radius:12px;padding:6px 10px;color:#78e7db;font-weight:700}
 QLabel#emptyState{background:#10182a;border:1px dashed #31405e;border-radius:16px;color:#77849d;padding:50px;font-size:15px}
 QLineEdit,QSpinBox{background:#0d1424;border:1px solid #2a3652;border-radius:10px;padding:10px;color:#edf2ff}
@@ -59,6 +62,8 @@ QLabel#title{font-size:25px;font-weight:800}
 QLabel#subtitle,QLabel#muted{color:#66738a}
 QLabel#metric{font-size:25px;font-weight:800}
 QLabel#metricLabel{color:#66738a;font-size:11px}
+QLabel#previewSessionCaption{color:#7b8799;font-size:9px;font-weight:800;letter-spacing:1px}
+QLabel#previewCacheStatus{background:#f7f9fc;border:1px solid #dce3ee;border-radius:10px;padding:8px;color:#66738a;font-size:10px;line-height:1.25}
 QLabel#pill{background:#e8f7f5;border:1px solid #bce7e2;border-radius:12px;padding:6px 10px;color:#087f78;font-weight:700}
 QLabel#emptyState{background:#ffffff;border:1px dashed #c9d4e5;border-radius:16px;color:#718096;padding:50px;font-size:15px}
 QLineEdit,QSpinBox{background:#f8fafc;border:1px solid #ccd6e4;border-radius:10px;padding:10px;color:#172033}
@@ -172,6 +177,31 @@ class MainWindow(QMainWindow):
         side.addWidget(self.nav_encrypt)
         side.addWidget(self.nav_decrypt)
         side.addWidget(self.nav_preview)
+
+        # One global preview-session timer. It is hidden until a secure
+        # preview session starts and is removed/hidden when the session ends.
+        timer_caption = QLabel("PREVIEW SESSION")
+        timer_caption.setObjectName("previewSessionCaption")
+        timer_caption.setAlignment(Qt.AlignCenter)
+        side.addWidget(timer_caption)
+        self.preview_timer_widget = QLabel()
+        self.preview_timer_widget.setObjectName("previewSidebarTimer")
+        self.preview_timer_widget.setAlignment(Qt.AlignCenter)
+        self.preview_timer_widget.setMinimumHeight(44)
+        self.preview_timer_widget.setMaximumHeight(50)
+        self.preview_timer_widget.setToolTip("Global preview time remaining")
+        self.preview_timer_widget.setText("Preview  00:00")
+        self.preview_timer_widget.hide()
+        side.addWidget(self.preview_timer_widget)
+
+        self.preview_cache_widget = QLabel("Cache ready  •  0 cached  •  0.0 / 90 MB  •  0 loading")
+        self.preview_cache_widget.setObjectName("previewCacheStatus")
+        self.preview_cache_widget.setWordWrap(True)
+        self.preview_cache_widget.setAlignment(Qt.AlignCenter)
+        self.preview_cache_widget.setMinimumHeight(58)
+        self.preview_cache_widget.setToolTip("Live thumbnail RAM cache activity")
+        side.addWidget(self.preview_cache_widget)
+        side.addSpacing(10)
         side.addStretch()
         security = QFrame()
         security.setObjectName("card")
@@ -217,6 +247,9 @@ class MainWindow(QMainWindow):
         self.encrypt_page = self.build_transfer_page("encrypt")
         self.decrypt_page = self.build_transfer_page("decrypt")
         self.preview_page = PreviewPanel(self)
+        self.preview_page.preview_timer_changed.connect(self._show_preview_sidebar_timer)
+        self.preview_page.preview_timer_finished.connect(self._hide_preview_sidebar_timer)
+        self.preview_page.cache_status_changed.connect(self._show_preview_cache_status)
         self.stack.addWidget(self.encrypt_page)
         self.stack.addWidget(self.decrypt_page)
         self.stack.addWidget(self.preview_page)
@@ -225,6 +258,20 @@ class MainWindow(QMainWindow):
 
         self.nav_encrypt.setChecked(True)
         self.set_mode("encrypt")
+
+    def _show_preview_sidebar_timer(self, seconds):
+        seconds = max(0, int(seconds))
+        minutes, secs = divmod(seconds, 60)
+        self.preview_timer_widget.setText(f"Preview  {minutes:02d}:{secs:02d}")
+        self.preview_timer_widget.show()
+
+    def _show_preview_cache_status(self, text):
+        self.preview_cache_widget.setText(text)
+        self.preview_cache_widget.show()
+
+    def _hide_preview_sidebar_timer(self):
+        self.preview_timer_widget.clear()
+        self.preview_timer_widget.hide()
 
     def _nav(self, text, mode):
         b = QPushButton(text)
@@ -275,9 +322,9 @@ class MainWindow(QMainWindow):
         key_row = QHBoxLayout()
         key_row.setSpacing(8)
         password = QLineEdit()
-        password.setMaxLength(6)
+        password.setMaxLength(12)
         password.setEchoMode(QLineEdit.Password)
-        password.setPlaceholderText("Enter your 6-character access key")
+        password.setPlaceholderText("Enter access key (4–12 characters)")
         password.setMinimumHeight(42)
         show = QPushButton("Show")
         show.setCheckable(True)
@@ -403,11 +450,12 @@ class MainWindow(QMainWindow):
         if Path(inp).resolve() == Path(out).resolve():
             QMessageBox.warning(self, "Folders", "Input and output folders must differ.")
             return
-        if len(password) != 6:
-            QMessageBox.warning(self, "Access key", "The key must be exactly 6 characters.")
+        if not 4 <= len(password) <= 12:
+            QMessageBox.warning(self, "Access key", "The key must be 4–12 characters long.")
             return
         Path(out).mkdir(parents=True, exist_ok=True)
         self.active_page = page
+        self._job_errors = []
         page.start.setEnabled(False)
         page.cancel.setEnabled(True)
         page.password.setEnabled(False)
@@ -437,8 +485,17 @@ class MainWindow(QMainWindow):
         page.status.setText(f"{action} {Path(name).name} • {value}%")
 
     def on_error(self, message):
-        self.active_page.status.setText("Completed with errors.")
-        QMessageBox.warning(self, "File processing error", message)
+        """Collect worker errors and show a single dialog when the job ends.
+
+        Decryption can fail for every file when the access key is wrong. Showing
+        one QMessageBox per failed file makes the UI unusable, so errors are
+        aggregated and presented once after processing finishes.
+        """
+        if not hasattr(self, "_job_errors"):
+            self._job_errors = []
+        self._job_errors.append(str(message))
+        if self.active_page:
+            self.active_page.status.setText("Processing completed with errors…")
 
     def on_finished(self, successful, failed):
         page = self.active_page
@@ -449,6 +506,29 @@ class MainWindow(QMainWindow):
             page.progress.setValue(100)
             page.percent.setText("100%")
         page.status.setText(f"Finished • {successful} succeeded • {failed} failed")
+
+        errors = getattr(self, "_job_errors", [])
+        if errors:
+            # A wrong key normally causes the same authentication failure for
+            # every encrypted file. Collapse that into one useful message.
+            if self.mode == "decrypt" and failed:
+                title = "Decryption failed"
+                if any("InvalidTag" in e or "authentication" in e.lower() or "authenticate" in e.lower() for e in errors):
+                    detail = (
+                        "The access key is incorrect, or the encrypted file "
+                        "has been modified/corrupted. No decrypted files were created for failed items."
+                    )
+                else:
+                    detail = f"{failed} file(s) could not be decrypted."
+            else:
+                title = "File processing errors"
+                # Keep the dialog compact even for many independent failures.
+                shown = errors[:8]
+                detail = "\n".join(f"• {e}" for e in shown)
+                if len(errors) > len(shown):
+                    detail += f"\n• …and {len(errors) - len(shown)} more error(s)."
+            QMessageBox.warning(self, title, detail)
+            self._job_errors = []
 
     def cancel_job(self):
         if self.worker:
